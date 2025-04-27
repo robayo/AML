@@ -1,3 +1,9 @@
 pandas
 networkx
 kagglehub
+fastparquet
+plotly
+scipy
+tqdm
+torch
+torch_geometric

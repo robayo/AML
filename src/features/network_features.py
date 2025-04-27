@@ -1,9 +1,4 @@
-
-import argparse
-import pathlib
 import random
-import time
-from typing import List, Dict
 
 import numpy as np
 import pandas as pd
@@ -16,70 +11,111 @@ from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import from_networkx
 
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, roc_auc_score
-import lightgbm as lgb
-
 def build_nx_graph(edges: pd.DataFrame) -> nx.Graph:
-    G = nx.Graph()
+    G = nx.DiGraph() 
     G.add_edges_from(edges[['src', 'dst']].itertuples(index=False, name=None))
     return G
 
+def create_label_dict(df):
+    """Create a dictionary mapping txId to class label."""
+    return dict(zip(df['txId'], df['class_label']))
 
-##############################################################################
-#                        GuiltyWalker Feature Set                             #
-##############################################################################
-
-def guilty_walker_features(G: nx.Graph,
-                           labels: Dict[int, str],
-                           num_walks: int = 16,
-                           walk_len: int = 20,
-                           restart_prob: float = 0.15) -> pd.DataFrame:
-    """Compute GuiltyWalker‑style random‑walk statistics for every node.
-
-    For each node v, launch `num_walks` random walks. Any visit to an
-    `illicit` node marks the walk as suspicious. We record:
-      – gw_hit_ratio: proportion of walks that hit an illicit node
-      – gw_min_step: min steps until first illicit hit (∞ if none)
-      – gw_avg_step: average step index of first illicit hit
-    """
-    illicit_nodes = {n for n, lbl in labels.items() if lbl == ' illicit'}
+def guilty_walker_features(df, time_step_graphs, num_walks=500, walk_len=50, restart_prob=0.10):
+    """Much faster GuiltyWalker implementation using time step information."""
+    # Create a mapping of nodes to their time steps
+    node_to_time = dict(zip(df['txId'], df['time_step']))
+    
+    # Create mapping of nodes to labels
+    node_to_label = dict(zip(df['txId'], df['class_label']))
+    
+    # Initialize results dictionary
     feature_dict = {
         'txId': [],
         'gw_hit_ratio': [],
         'gw_min_step': [],
         'gw_avg_step': [],
+        'gw_unique_illicit': [],
     }
-
-    for v in tqdm(G.nodes(), desc='GuiltyWalker'):
-        hits = []
-        min_steps = []
-        for _ in range(num_walks):
-            current = v
-            for step in range(1, walk_len + 1):
-                if current in illicit_nodes:
-                    hits.append(1)
-                    min_steps.append(step)
-                    break
-                if random.random() < restart_prob:
-                    current = v  # restart
-                else:
-                    nbrs = list(G.neighbors(current))
-                    if not nbrs:
+    
+    # Process each time step separately
+    for time_step, G in tqdm(time_step_graphs.items(), desc='Processing time steps'):
+        # Create reversed graph for backward traversal
+        G_inv = G.reverse(copy=True)
+        
+        # Get illicit nodes for this time step
+        illicit_nodes = {n for n in G.nodes() if node_to_label.get(n) == 'illicit'}
+        
+        # Process each node in this time step
+        for v in G.nodes():
+            hits = []
+            step_hits = []
+            illicit_encountered = set()
+            
+            for _ in range(num_walks):
+                current = v
+                walk_hit = False
+                
+                for step in range(1, walk_len + 1):
+                    # Get predecessors (walking backward in time)
+                    preds = list(G_inv.neighbors(current))
+                    if not preds:
                         break
-                    current = random.choice(nbrs)
+                    current = random.choice(preds)
+
+                    # Check if current node is illicit (skipping the starting node)
+                    if step > 1 and current in illicit_nodes:
+                        hits.append(1)
+                        step_hits.append(step)
+                        illicit_encountered.add(current)
+                        walk_hit = True
+                        break
+                    
+                    # Random walk restart logic  
+                    if random.random() < restart_prob:
+                        current = v  # restart
+                
+                if not walk_hit:
+                    hits.append(0)
+            
+            hit_ratio = np.mean(hits) if hits else 0.0
+            feature_dict['txId'].append(v) 
+            feature_dict['gw_hit_ratio'].append(hit_ratio)
+            feature_dict['gw_unique_illicit'].append(len(illicit_encountered))
+            
+            if step_hits:
+                feature_dict['gw_min_step'].append(min(step_hits))
+                feature_dict['gw_avg_step'].append(np.mean(step_hits))
             else:
-                hits.append(0)
-        hit_ratio = np.mean(hits)
-        feature_dict['txId'].append(v)
-        feature_dict['gw_hit_ratio'].append(hit_ratio)
-        if min_steps:
-            feature_dict['gw_min_step'].append(min(min_steps))
-            feature_dict['gw_avg_step'].append(np.mean(min_steps))
-        else:
-            feature_dict['gw_min_step'].append(walk_len + 1)
-            feature_dict['gw_avg_step'].append(walk_len + 1)
+                feature_dict['gw_min_step'].append(walk_len + 1)  # infinity proxy 
+                feature_dict['gw_avg_step'].append(walk_len + 1)  # infinity proxy
+    
     return pd.DataFrame(feature_dict)
+
+def build_time_step_graphs(edges, df):
+    """Build separate directed graphs for each time step more efficiently."""
+    # Group nodes by time_step
+    time_step_nodes = df.groupby('time_step')['txId'].apply(list).to_dict()
+    
+    # Create graphs for each time step
+    time_step_graphs = {}
+    
+    # Process all edges in one go
+    edge_df = edges.copy()
+    # Add time_step information to edges
+    edge_df = edge_df.merge(df[['txId', 'time_step']], left_on='src', right_on='txId', how='inner')
+    edge_df = edge_df.rename(columns={'time_step': 'src_time'})
+    edge_df = edge_df.drop('txId', axis=1)
+    
+    # Group edges by time_step and build graphs
+    for time_step, group in edge_df.groupby('src_time'):
+        G = nx.DiGraph()
+        # Add all nodes for this time step
+        G.add_nodes_from(time_step_nodes[time_step])
+        # Add edges
+        G.add_edges_from(group[['src', 'dst']].values)
+        time_step_graphs[time_step] = G
+    
+    return time_step_graphs
 
 
 ##############################################################################
@@ -87,14 +123,13 @@ def guilty_walker_features(G: nx.Graph,
 ##############################################################################
 
 class GCN(nn.Module):
-    def __init__(self, in_feats: int, hidden: int = 64, out_feats: int = 32,
-                 dropout: float = 0.3):
+    def __init__(self, in_feats, hidden=64, out_feats=32, dropout=0.3):
         super().__init__()
         self.conv1 = GCNConv(in_feats, hidden)
         self.conv2 = GCNConv(hidden, out_feats)
         self.dropout = nn.Dropout(dropout)
         self.relu = nn.ReLU()
-
+    
     def forward(self, x, edge_index):
         x = self.relu(self.conv1(x, edge_index))
         x = self.dropout(x)
@@ -102,43 +137,105 @@ class GCN(nn.Module):
         return x
 
 
-def train_gcn_get_embeddings(G: nx.Graph, df: pd.DataFrame,
-                             feature_cols: List[str],
-                             epochs: int = 30,
-                             lr: float = 1e‑3,
-                             device: str = 'cpu') -> pd.DataFrame:
-    """Train semi‑supervised GCN and return hidden embeddings."""
-    # PyG data
-    pyg_graph = from_networkx(G)
-    # Align features order with node index
-    feat_mat = df.set_index('txId').loc[pyg_graph['x_idx'] if 'x_idx' in pyg_graph else G.nodes()].fillna(0)[feature_cols].values
-    pyg_graph.x = torch.tensor(feat_mat, dtype=torch.float32)
-    # Labels: 1=illicit, 0=licit, ‑1=unknown
-    label_map = {' illict': 1, ' licit': 0, 'unknown': -1}
-    y = df.set_index('txId')['class_label'].map(label_map).fillna(-1).astype(int).values
-    pyg_graph.y = torch.tensor(y, dtype=torch.long)
-    train_mask = pyg_graph.y >= 0  # only labelled nodes
-    pyg_graph.train_mask = torch.tensor(train_mask, dtype=torch.bool)
-    pyg_graph = pyg_graph.to(device)
+def train_gcn_get_embeddings(df, time_step_graphs, feature_cols, epochs=30, lr=1e-3, device='cpu'):
+    """Train semi-supervised GCN for each time step and return embeddings."""
+    all_embeddings = []
+    
+    for time_step, G in tqdm(time_step_graphs.items(), desc="GCN Embeddings"):
+        if len(G.nodes()) < 10:  # Skip very small graphs
+            continue
+            
+        # Filter dataframe for nodes in this time step
+        sub_df = df[df['time_step'] == time_step]
+        nodes = list(G.nodes())
+        
+        if len(sub_df) < 10:  # Skip if not enough data
+            continue
+            
+        # PyG data
+        pyg_graph = from_networkx(G)
+        
+        # Prepare feature matrix - align with node order in the graph
+        node_to_idx = {node: i for i, node in enumerate(nodes)}
+        
+        # Make sure all nodes are in dataframe
+        nodes_in_df = [n for n in nodes if n in sub_df['txId'].values]
+        
+        if not nodes_in_df:
+            continue
+            
+        # Get features for these nodes
+        node_df = sub_df[sub_df['txId'].isin(nodes_in_df)]
+        feat_mat = node_df.set_index('txId')[feature_cols].fillna(0).values
+        
+        # Create node index to feature row mapping
+        node_to_feat_row = {node: i for i, node in enumerate(node_df['txId'])}
+        
+        # Create edge index for PyG
+        edge_list = list(G.edges())
+        src_nodes = [src for src, _ in edge_list if src in node_to_feat_row]
+        dst_nodes = [dst for _, dst in edge_list if dst in node_to_feat_row]
+        
+        if not src_nodes or not dst_nodes:
+            continue
+            
+        # Map to indices
+        src_indices = [node_to_idx[src] for src in src_nodes]
+        dst_indices = [node_to_idx[dst] for dst in dst_nodes]
+        
+        edge_index = torch.tensor([src_indices, dst_indices], dtype=torch.long)
+        
+        # Features and labels
+        x = torch.tensor(feat_mat, dtype=torch.float32)
+        
+        # Map labels: illicit=1, licit=0, unknown=-1
+        label_map = {'illicit': 1, 'licit': 0, 'unknown': -1}
+        y = node_df['class_label'].map(label_map).fillna(-1).astype(int).values
+        y = torch.tensor(y, dtype=torch.long)
+        
+        # Setup train mask
+        train_mask = y >= 0  # Only labeled nodes
+        train_mask = torch.tensor(train_mask, dtype=torch.bool)
+        
+        if not train_mask.any():  # Skip if no labeled nodes
+            continue
+        
+        # Create PyG data object
+        data = Data(x=x, edge_index=edge_index, y=y)
+        data.train_mask = train_mask
+        data = data.to(device)
+        
+        # Initialize model
+        model = GCN(in_feats=len(feature_cols), hidden=128, out_feats=64).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
+        loss_fn = nn.CrossEntropyLoss()
+        
+        # Training loop
+        model.train()
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            out = model(data.x, data.edge_index)
+            loss = loss_fn(out[data.train_mask], data.y[data.train_mask])
+            loss.backward()
+            optimizer.step()
+            if epoch % 10 == 0:
+                print(f"Time step {time_step}, Epoch {epoch}: Loss {loss.item():.4f}")
+        
+        # Get embeddings
+        model.eval()
+        with torch.no_grad():
+            emb = model(data.x, data.edge_index).cpu().numpy()
+        
+        # Create embedding dataframe
+        emb_df = pd.DataFrame(emb, columns=[f'gcn_{i}' for i in range(emb.shape[1])])
+        emb_df['txId'] = node_df['txId'].values
+        
+        all_embeddings.append(emb_df)
+    
+    # Combine all embeddings
+    if all_embeddings:
+        return pd.concat(all_embeddings, ignore_index=True)
+    else:
+        # Return empty DataFrame with correct columns
+        return pd.DataFrame(columns=['txId'] + [f'gcn_{i}' for i in range(64)])
 
-    model = GCN(in_feats=len(feature_cols), hidden=128, out_feats=64).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e‑4)
-    loss_fn = nn.CrossEntropyLoss()
-
-    model.train()
-    for epoch in range(epochs):
-        optimizer.zero_grad()
-        out = model(pyg_graph.x, pyg_graph.edge_index)
-        loss = loss_fn(out[pyg_graph.train_mask], pyg_graph.y[pyg_graph.train_mask])
-        loss.backward()
-        optimizer.step()
-        if epoch % 5 == 0:
-            print(f'Epoch {epoch:02d}: Loss {loss.item():.4f}')
-
-    model.eval()
-    with torch.no_grad():
-        emb = model(pyg_graph.x, pyg_graph.edge_index).cpu().numpy()
-
-    emb_df = pd.DataFrame(emb, columns=[f'gcn_{i}' for i in range(emb.shape[1])])
-    emb_df['txId'] = df.set_index('txId').loc[pyg_graph['x_idx'] if 'x_idx' in pyg_graph else G.nodes()].index
-    return emb_df
