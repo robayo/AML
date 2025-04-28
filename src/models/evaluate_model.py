@@ -2,10 +2,15 @@ from sklearn.metrics import (
     classification_report, confusion_matrix, f1_score,
     roc_auc_score, average_precision_score, precision_score, recall_score
 )
-import time
-import pandas as pd
-import xgboost as xgb
 import numpy as np
+import pandas as pd
+import datetime
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.express as px
+from sklearn.metrics import f1_score, precision_score, recall_score
+import xgboost as xgb
+import time
 from src.models.train_model import  add_anomaly_scores
 # Enhanced evaluation function with multiple metrics
 def evaluate_model(model, X, y, model_name, threshold=0.5, is_isolation_forest=False, anomaly_score_col=None):
@@ -341,17 +346,409 @@ def batch_prediction_pipeline(data, iso_forest_model, xgb_model, threshold,
     
     return combined_results, final_metadata
 
-# Example of using batch processing (commented out)
-print("""
-# Example usage of batch processing
-batch_results, batch_metadata = batch_prediction_pipeline(
-    'data/large_blockchain_data/',  # Directory with parquet files
-    loaded_iso_forest,
-    loaded_xgb_model,
-    config['threshold'],
-    batch_size=50000,
-    explain=False  # Set to True for explanations (slower)
-)
-""")
 
-print("\n=== PIPELINE COMPLETE ===")
+
+# Function to evaluate illicit detection metrics by time period
+def evaluate_by_time(data, y_true, y_pred_proba, threshold, time_column, time_freq='D'):
+    """
+    Evaluate model performance across time periods
+    
+    Parameters:
+    -----------
+    data : DataFrame
+        DataFrame containing the data
+    y_true : Series
+        True labels (0 for licit, 1 for illicit)
+    y_pred_proba : array-like
+        Predicted probabilities for illicit class
+    threshold : float
+        Decision threshold for classification
+    time_column : str
+        Name of the column containing timestamps
+    time_freq : str
+        Time frequency for grouping ('D' for day, 'W' for week, 'M' for month)
+    
+    Returns:
+    --------
+    DataFrame with performance metrics by time period
+    """
+    # Convert predictions to binary using threshold
+    y_pred = (y_pred_proba > threshold).astype(int)
+    
+    # Create a DataFrame with actual labels, predictions, and time
+    eval_df = pd.DataFrame({
+        'time': data[time_column],
+        'y_true': y_true,
+        'y_pred': y_pred,
+        'y_prob': y_pred_proba
+    })
+    
+    
+    # Group by time period and calculate metrics
+    results = []
+    
+    # For each time period
+    for period, group in eval_df.groupby('time'):
+        # Skip periods with too few samples
+        if len(group) < 10 or sum(group['y_true']) < 2:
+            continue
+            
+        # Calculate metrics
+        period_metrics = {
+            'period': period,
+            'samples': len(group),
+            'illicit_count': sum(group['y_true']),
+            'illicit_pct': sum(group['y_true']) / len(group) * 100,
+            'precision': precision_score(group['y_true'], group['y_pred']),
+            'recall': recall_score(group['y_true'], group['y_pred']),
+            'f1': f1_score(group['y_true'], group['y_pred']),
+            'avg_prob': group['y_prob'].mean()
+        }
+        results.append(period_metrics)
+    
+    # Convert to DataFrame
+    results_df = pd.DataFrame(results)
+    
+    # Sort by time period
+    results_df = results_df.sort_values('period')
+    
+    return results_df
+# Function to plot performance over time using Plotly
+def plot_performance_over_time(time_metrics, metric='f1', 
+                              title=None, plot_illicit_pct=True):
+    """
+    Plot model performance metrics over time using Plotly
+    
+    Parameters:
+    -----------
+    time_metrics : DataFrame
+        DataFrame from evaluate_by_time function
+    metric : str
+        Metric to plot ('f1', 'precision', or 'recall')
+    title : str, optional
+        Plot title
+    plot_illicit_pct : bool
+        Whether to plot illicit percentage as secondary axis
+    """
+    # Create figure with secondary y-axis
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    # Add main metric trace
+    fig.add_trace(
+        go.Scatter(
+            x=time_metrics['period'],
+            y=time_metrics[metric],
+            mode='lines+markers',
+            name=f'Illicit {metric.capitalize()}',
+            marker=dict(size=8, color='blue'),
+            line=dict(width=2, color='blue'),
+            hovertemplate='<b>Date</b>: %{x|%Y-%m-%d}<br>'
+                         f'<b>Illicit {metric.capitalize()}</b>: %{{y:.4f}}<br>'
+                         '<extra></extra>'
+        ),
+        secondary_y=False
+    )
+    
+    # Add illicit percentage if requested
+    if plot_illicit_pct:
+        fig.add_trace(
+            go.Scatter(
+                x=time_metrics['period'],
+                y=time_metrics['illicit_pct'],
+                mode='lines+markers',
+                name='Illicit %',
+                marker=dict(size=6, color='red'),
+                line=dict(width=1.5, dash='dash', color='red'),
+                hovertemplate='<b>Date</b>: %{x|%Y-%m-%d}<br>'
+                             '<b>Illicit %</b>: %{y:.2f}%<br>'
+                             '<b>Count</b>: ' + time_metrics['illicit_count'].astype(str) + ' / ' + 
+                             time_metrics['samples'].astype(str) + 
+                             '<extra></extra>'
+            ),
+            secondary_y=True
+        )
+    
+    # Set figure layout
+    if title:
+        fig.update_layout(title=title)
+    else:
+        fig.update_layout(title=f'Illicit {metric.capitalize()} Score Over Time')
+    
+    fig.update_layout(
+        hovermode="x unified",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
+        template="plotly_white"
+    )
+    
+    # Set y-axes titles
+    fig.update_yaxes(title_text=f"Illicit {metric.capitalize()} Score", range=[0, 1], secondary_y=False)
+    if plot_illicit_pct:
+        fig.update_yaxes(title_text="Illicit %", range=[0, max(time_metrics['illicit_pct'])*1.2], secondary_y=True)
+    
+    # Update x-axis
+    fig.update_xaxes(title_text='Time Period')
+    
+    # Add grid
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='lightgray')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgray')
+    
+    return fig
+
+# Function to compare multiple models over time using Plotly
+def compare_models_over_time(data, y_true, time_column, model_preds, 
+                            thresholds, model_names, time_freq='D',
+                            metric='f1'):
+    """
+    Compare multiple models' performance over time using Plotly
+    
+    Parameters:
+    -----------
+    data : DataFrame
+        DataFrame containing the data
+    y_true : Series
+        True labels (0 for licit, 1 for illicit)
+    time_column : str
+        Name of the column containing timestamps
+    model_preds : list of arrays
+        List of predicted probabilities from different models
+    thresholds : list of floats
+        Decision thresholds for each model
+    model_names : list of str
+        Names for each model
+    time_freq : str
+        Time frequency for grouping ('D' for day, 'W' for week, 'M' for month)
+    metric : str
+        Metric to plot ('f1', 'precision', or 'recall')
+    """
+    # Get metrics for each model
+    model_metrics = []
+    
+    for i, (preds, threshold, name) in enumerate(zip(model_preds, thresholds, model_names)):
+        metrics = evaluate_by_time(data, y_true, preds, threshold, time_column, time_freq)
+        metrics['model'] = name
+        model_metrics.append(metrics)
+    
+    # Combine metrics
+    all_metrics = pd.concat(model_metrics)
+    
+    # Create figure with secondary y-axis
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    # Plot each model's metric
+    colors = ['blue', 'green', 'red', 'purple', 'orange', 'brown']
+    
+    for i, name in enumerate(model_names):
+        model_data = all_metrics[all_metrics['model'] == name]
+        color = colors[i % len(colors)]
+        
+        fig.add_trace(
+            go.Scatter(
+                x=model_data['period'],
+                y=model_data[metric],
+                mode='lines+markers',
+                name=name,
+                marker=dict(size=8, color=color),
+                line=dict(width=2, color=color),
+                hovertemplate='<b>Model</b>: ' + name + '<br>'
+                             '<b>Date</b>: %{x|%Y-%m-%d}<br>'
+                             f'<b>{metric.capitalize()}</b>: %{{y:.4f}}<br>'
+                             '<extra></extra>'
+            ),
+            secondary_y=False
+        )
+    
+    # Add illicit percentage line (using the first model's data)
+    first_model = model_metrics[0]
+    fig.add_trace(
+        go.Scatter(
+            x=first_model['period'],
+            y=first_model['illicit_pct'],
+            mode='lines',
+            name='Illicit %',
+            line=dict(width=1.5, dash='dash', color='gray'),
+            opacity=0.6,
+            hovertemplate='<b>Date</b>: %{x|%Y-%m-%d}<br>'
+                         '<b>Illicit %</b>: %{y:.2f}%<br>'
+                         '<extra></extra>'
+        ),
+        secondary_y=True
+    )
+    
+    # Set figure layout
+    fig.update_layout(
+        title=f'Comparison of Illicit {metric.capitalize()} Score Over Time',
+        hovermode="x unified",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
+        template="plotly_white"
+    )
+    
+    # Set y-axes titles
+    fig.update_yaxes(title_text=f"Illicit {metric.capitalize()} Score", range=[0, 1], secondary_y=False)
+    fig.update_yaxes(title_text="Illicit %", range=[0, max(first_model['illicit_pct'])*1.2], secondary_y=True)
+    
+    # Update x-axis
+    fig.update_xaxes(title_text='Time Period')
+    
+    # Add grid
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='lightgray')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgray')
+    
+    return fig
+
+
+
+# Function to analyze performance drift using Plotly
+def analyze_performance_drift(time_metrics, metric='f1', window=3, threshold=0.1):
+    """
+    Analyze performance drift over time and detect significant changes
+    
+    Parameters:
+    -----------
+    time_metrics : DataFrame
+        DataFrame from evaluate_by_time function
+    metric : str
+        Metric to analyze ('f1', 'precision', or 'recall')
+    window : int
+        Rolling window size for trend analysis
+    threshold : float
+        Threshold for significant change detection
+    
+    Returns:
+    --------
+    DataFrame with drift analysis and Plotly figure
+    """
+    # Need at least window+1 data points
+    if len(time_metrics) <= window:
+        print(f"Not enough time periods for drift analysis (need >{window}, got {len(time_metrics)})")
+        return time_metrics, None
+    
+    # Calculate rolling statistics
+    time_metrics['rolling_mean'] = time_metrics[metric].rolling(window=window, min_periods=1).mean()
+    
+    # Calculate changes
+    time_metrics['change'] = time_metrics[metric] - time_metrics['rolling_mean'].shift(1)
+    
+    # Detect significant changes
+    time_metrics['significant_change'] = abs(time_metrics['change']) > threshold
+    time_metrics['improvement'] = (time_metrics['change'] > threshold)
+    time_metrics['degradation'] = (time_metrics['change'] < -threshold)
+    
+    # Find periods with notable changes
+    if sum(time_metrics['significant_change']) > 0:
+        print("\nTime periods with significant performance changes:")
+        for idx, row in time_metrics[time_metrics['significant_change']].iterrows():
+            change_type = "improvement" if row['improvement'] else "degradation"
+            print(f"  Period {row['period']}: {change_type} ({row[metric]:.3f}, change: {row['change']:.3f})")
+    
+    # Create Plotly figure for drift analysis
+    fig = go.Figure()
+    
+    # Add main metric line
+    fig.add_trace(
+        go.Scatter(
+            x=time_metrics['period'],
+            y=time_metrics[metric],
+            mode='lines+markers',
+            name=f'{metric.capitalize()} Score',
+            marker=dict(size=8, color='blue'),
+            line=dict(width=2, color='blue'),
+            hovertemplate='<b>Date</b>: %{x|%Y-%m-%d}<br>'
+                         f'<b>{metric.capitalize()}</b>: %{{y:.4f}}<br>'
+                         '<extra></extra>'
+        )
+    )
+    
+    # Add rolling average
+    fig.add_trace(
+        go.Scatter(
+            x=time_metrics['period'],
+            y=time_metrics['rolling_mean'],
+            mode='lines',
+            name='Rolling Average',
+            line=dict(width=1.5, dash='dot', color='gray'),
+            hovertemplate='<b>Date</b>: %{x|%Y-%m-%d}<br>'
+                         '<b>Rolling Avg</b>: %{y:.4f}<br>'
+                         '<extra></extra>'
+        )
+    )
+    
+    # Add improvements as markers
+    improvements = time_metrics[time_metrics['improvement']]
+    if len(improvements) > 0:
+        fig.add_trace(
+            go.Scatter(
+                x=improvements['period'],
+                y=improvements[metric],
+                mode='markers',
+                name='Improvement',
+                marker=dict(
+                    symbol='triangle-up',
+                    size=12,
+                    color='green',
+                    line=dict(width=1, color='darkgreen')
+                ),
+                hovertemplate='<b>Date</b>: %{x|%Y-%m-%d}<br>'
+                             f'<b>{metric.capitalize()}</b>: %{{y:.4f}}<br>'
+                             '<b>Change</b>: +%{text:.4f}<br>'
+                             '<extra></extra>',
+                text=improvements['change'].abs()
+            )
+        )
+    
+    # Add degradations as markers
+    degradations = time_metrics[time_metrics['degradation']]
+    if len(degradations) > 0:
+        fig.add_trace(
+            go.Scatter(
+                x=degradations['period'],
+                y=degradations[metric],
+                mode='markers',
+                name='Degradation',
+                marker=dict(
+                    symbol='triangle-down',
+                    size=12,
+                    color='red',
+                    line=dict(width=1, color='darkred')
+                ),
+                hovertemplate='<b>Date</b>: %{x|%Y-%m-%d}<br>'
+                             f'<b>{metric.capitalize()}</b>: %{{y:.4f}}<br>'
+                             '<b>Change</b>: -%{text:.4f}<br>'
+                             '<extra></extra>',
+                text=degradations['change'].abs()
+            )
+        )
+    
+    # Set figure layout
+    fig.update_layout(
+        title=f'{metric.capitalize()} Score Drift Analysis Over Time',
+        xaxis_title='Time Period',
+        yaxis_title=f'{metric.capitalize()} Score',
+        yaxis=dict(range=[0, 1]),
+        hovermode="x unified",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
+        template="plotly_white"
+    )
+    
+    # Add grid
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='lightgray')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgray')
+    
+    return time_metrics, fig
