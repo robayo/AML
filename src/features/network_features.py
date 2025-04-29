@@ -117,11 +117,6 @@ def build_time_step_graphs(edges, df):
     
     return time_step_graphs
 
-
-##############################################################################
-#                 Graph Convolutional Network Embeddings                      #
-##############################################################################
-
 class GCN(nn.Module):
     def __init__(self, in_feats, hidden=64, out_feats=32, dropout=0.3):
         super().__init__()
