@@ -135,11 +135,10 @@ class GCN(nn.Module):
         x = self.dropout(x)
         x = self.conv2(x, edge_index)
         return x
-
-
 def train_gcn_get_embeddings(df, time_step_graphs, feature_cols, epochs=30, lr=1e-3, device='cpu'):
-    """Train semi-supervised GCN for each time step and return embeddings."""
+    """Train semi-supervised GCN for each time step and return embeddings and models."""
     all_embeddings = []
+    time_step_models = {}  # Dictionary to store trained models by time step
     
     for time_step, G in tqdm(time_step_graphs.items(), desc="GCN Embeddings"):
         if len(G.nodes()) < 10:  # Skip very small graphs
@@ -168,13 +167,10 @@ def train_gcn_get_embeddings(df, time_step_graphs, feature_cols, epochs=30, lr=1
         node_df = sub_df[sub_df['txId'].isin(nodes_in_df)]
         feat_mat = node_df.set_index('txId')[feature_cols].fillna(0).values
         
-        # Create node index to feature row mapping
-        node_to_feat_row = {node: i for i, node in enumerate(node_df['txId'])}
-        
         # Create edge index for PyG
         edge_list = list(G.edges())
-        src_nodes = [src for src, _ in edge_list if src in node_to_feat_row]
-        dst_nodes = [dst for _, dst in edge_list if dst in node_to_feat_row]
+        src_nodes = [src for src, _ in edge_list if src in node_df['txId'].values]
+        dst_nodes = [dst for _, dst in edge_list if dst in node_df['txId'].values]
         
         if not src_nodes or not dst_nodes:
             continue
@@ -189,11 +185,13 @@ def train_gcn_get_embeddings(df, time_step_graphs, feature_cols, epochs=30, lr=1
         x = torch.tensor(feat_mat, dtype=torch.float32)
         
         # Map labels: illicit=1, licit=0, unknown=-1
+        # For training, we'll use known labels but will also consider the graph structure
+        # including unlabeled nodes
         label_map = {'illicit': 1, 'licit': 0, 'unknown': -1}
         y = node_df['class_label'].map(label_map).fillna(-1).astype(int).values
         y = torch.tensor(y, dtype=torch.long)
         
-        # Setup train mask
+        # Setup train mask - only use nodes with known labels (illicit or licit)
         train_mask = y >= 0  # Only labeled nodes
         train_mask = torch.tensor(train_mask, dtype=torch.bool)
         
@@ -221,7 +219,89 @@ def train_gcn_get_embeddings(df, time_step_graphs, feature_cols, epochs=30, lr=1
             if epoch % 10 == 0:
                 print(f"Time step {time_step}, Epoch {epoch}: Loss {loss.item():.4f}")
         
-        # Get embeddings
+        # Get embeddings for all nodes (including unknown)
+        model.eval()
+        with torch.no_grad():
+            emb = model(data.x, data.edge_index).cpu().numpy()
+        
+        # Create embedding dataframe
+        emb_df = pd.DataFrame(emb, columns=[f'gcn_{i}' for i in range(emb.shape[1])])
+        emb_df['txId'] = node_df['txId'].values
+        
+        all_embeddings.append(emb_df)
+        
+        # Store the trained model
+        time_step_models[time_step] = {
+            'model': model.cpu(),  # Move model to CPU for storage
+            'node_mapping': node_to_idx  # Save the node mapping for inference
+        }
+    
+    # Combine all embeddings
+    combined_embeddings = pd.DataFrame(columns=['txId'] + [f'gcn_{i}' for i in range(64)])
+    if all_embeddings:
+        combined_embeddings = pd.concat(all_embeddings, ignore_index=True)
+    
+    return combined_embeddings, time_step_models
+
+
+def generate_embeddings(df, time_step_graphs, feature_cols, trained_models, device='cpu'):
+    """Generate embeddings for new data using pre-trained models."""
+    all_embeddings = []
+    
+    for time_step, G in tqdm(time_step_graphs.items(), desc="Generating Embeddings"):
+        # Skip if we don't have a trained model for this time step
+        if time_step not in trained_models:
+            print(f"No trained model for time step {time_step}, skipping")
+            continue
+            
+        if len(G.nodes()) < 10:  # Skip very small graphs
+            continue
+            
+        # Filter dataframe for nodes in this time step
+        sub_df = df[df['time_step'] == time_step]
+        nodes = list(G.nodes())
+        
+        if len(sub_df) < 10:  # Skip if not enough data
+            continue
+            
+        # Get the trained model for this time step
+        model = trained_models[time_step]['model'].to(device)
+        
+        # Make sure all nodes are in dataframe
+        nodes_in_df = [n for n in nodes if n in sub_df['txId'].values]
+        
+        if not nodes_in_df:
+            continue
+            
+        # Get features for these nodes
+        node_df = sub_df[sub_df['txId'].isin(nodes_in_df)]
+        feat_mat = node_df.set_index('txId')[feature_cols].fillna(0).values
+        
+        # Create node index to feature row mapping for this run
+        node_to_idx = {node: i for i, node in enumerate(nodes)}
+        
+        # Create edge index for PyG
+        edge_list = list(G.edges())
+        src_nodes = [src for src, _ in edge_list if src in node_df['txId'].values]
+        dst_nodes = [dst for _, dst in edge_list if dst in node_df['txId'].values]
+        
+        if not src_nodes or not dst_nodes:
+            continue
+            
+        # Map to indices
+        src_indices = [node_to_idx[src] for src in src_nodes]
+        dst_indices = [node_to_idx[dst] for dst in dst_nodes]
+        
+        edge_index = torch.tensor([src_indices, dst_indices], dtype=torch.long)
+        
+        # Features tensor
+        x = torch.tensor(feat_mat, dtype=torch.float32)
+        
+        # Create data object
+        data = Data(x=x, edge_index=edge_index)
+        data = data.to(device)
+        
+        # Generate embeddings
         model.eval()
         with torch.no_grad():
             emb = model(data.x, data.edge_index).cpu().numpy()
@@ -238,4 +318,3 @@ def train_gcn_get_embeddings(df, time_step_graphs, feature_cols, epochs=30, lr=1
     else:
         # Return empty DataFrame with correct columns
         return pd.DataFrame(columns=['txId'] + [f'gcn_{i}' for i in range(64)])
-
